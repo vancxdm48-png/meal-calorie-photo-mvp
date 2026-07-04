@@ -1,12 +1,13 @@
 const CACHE_NAME = "meal-calorie-photo-v2";
+const toScopeUrl = (path) => new URL(path, self.registration.scope).toString();
 const APP_SHELL = [
-  "/",
-  "/manifest.webmanifest",
-  "/assets/sample-meal.png",
-  "/icons/icon-192.png",
-  "/icons/icon-512.png",
-  "/icons/apple-touch-icon.png",
-];
+  "./",
+  "manifest.webmanifest",
+  "assets/sample-meal.png",
+  "icons/icon-192.png",
+  "icons/icon-512.png",
+  "icons/apple-touch-icon.png",
+].map(toScopeUrl);
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -38,6 +39,8 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
       })
-      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/"))),
+      .catch(() =>
+        caches.match(event.request).then((cached) => cached || caches.match(toScopeUrl("./"))),
+      ),
   );
 });

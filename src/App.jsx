@@ -14,6 +14,9 @@ import {
   Trash2,
 } from "lucide-react";
 
+const assetPath = (path) => `${import.meta.env.BASE_URL}${path}`;
+const sampleMealPath = assetPath("assets/sample-meal.png");
+
 const energyTargets = {
   male: {
     "18-29": { low: 2250, normal: 2600, high: 3000 },
@@ -234,7 +237,7 @@ export function App() {
   const [sex, setSex] = useState("female");
   const [age, setAge] = useState("30-49");
   const [activity, setActivity] = useState("normal");
-  const [preview, setPreview] = useState("/assets/sample-meal.png");
+  const [preview, setPreview] = useState(sampleMealPath);
   const [hint, setHint] = useState("ごはん小盛り、ドレッシングは半分など");
   const [resultVisible, setResultVisible] = useState(false);
   const [lastUpdated, setLastUpdated] = useState("デモ推定");
@@ -391,7 +394,7 @@ export function App() {
 
   const resetDemo = () => {
     setFoods(initialFoods);
-    setPreview("/assets/sample-meal.png");
+    setPreview(sampleMealPath);
     setHint("ごはん小盛り、ドレッシングは半分など");
     setResultVisible(false);
     setLastUpdated("デモ推定");
