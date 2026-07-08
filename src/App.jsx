@@ -113,10 +113,12 @@ const initialFoods = [
 ];
 
 const quickAddItems = [
-  { name: "マヨネーズ", amount: 15, unit: "g", kcal: 94 },
-  { name: "油", amount: 5, unit: "g", kcal: 37 },
-  { name: "バター", amount: 10, unit: "g", kcal: 75 },
-  { name: "タレ・ソース", amount: 20, unit: "g", kcal: 42 },
+  { name: "マヨネーズ", amount: 15, unit: "g", kcal: 100, protein: 0.2, fat: 11.3, carbs: 0.5 },
+  { name: "調理油", amount: 5, unit: "g", kcal: 44, protein: 0, fat: 5, carbs: 0 },
+  { name: "バター", amount: 10, unit: "g", kcal: 75, protein: 0.1, fat: 8.3, carbs: 0 },
+  { name: "タレ・ソース", amount: 20, unit: "g", kcal: 24, protein: 0.4, fat: 0.1, carbs: 5.4 },
+  { name: "ドレッシング", amount: 15, unit: "g", kcal: 60, protein: 0.1, fat: 6, carbs: 1.8 },
+  { name: "とろけるチーズ", amount: 18, unit: "g", kcal: 61, protein: 4.1, fat: 4.7, carbs: 0.2 },
 ];
 
 const formatNumber = (value) => Math.round(value).toLocaleString("ja-JP");
@@ -130,6 +132,231 @@ function calculateFood(food) {
     fat: food.fat * ratio,
     carbs: food.carbs * ratio,
   };
+}
+
+// 信頼度ごとの相対的な不確かさ（±割合）。写真からの推定は誤差が大きいため辛めに設定
+const confidenceUncertainty = { 高: 0.12, 中: 0.22, 低: 0.38 };
+
+// 各料理の量・信頼度を写真の特徴に応じて補正した合計カロリー範囲を、
+// 一律の割合ではなく信頼度加重（二乗和平方根）で求める
+function calculateRange(foods, extraUncertainty = 0) {
+  let total = 0;
+  let variance = 0;
+  for (const food of foods) {
+    const kcal = calculateFood(food).kcal;
+    total += kcal;
+    const u = confidenceUncertainty[food.confidence] ?? 0.25;
+    variance += Math.pow(kcal * u, 2);
+  }
+  // 写真解析そのものの不確かさ（構図・重量が読めないほど大きい）を上乗せ
+  const globalSigma = total * extraUncertainty;
+  const sigma = Math.sqrt(variance + globalSigma * globalSigma);
+  return {
+    total,
+    min: Math.max(0, total - sigma),
+    max: total + sigma,
+  };
+}
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// アップロード画像をブラウザ内で解析し、色構成・明るさ・テカリ（油）・
+// 食材の占有量などの特徴量を抽出する（サーバー送信なし）
+function analyzeImageFeatures(src) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const w = 120;
+      const h = Math.max(1, Math.round((img.height / img.width) * w));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) {
+        resolve(null);
+        return;
+      }
+      ctx.drawImage(img, 0, 0, w, h);
+      let data;
+      try {
+        data = ctx.getImageData(0, 0, w, h).data;
+      } catch {
+        resolve(null);
+        return;
+      }
+      const n = w * h;
+      let green = 0,
+        warm = 0,
+        pale = 0,
+        red = 0,
+        gloss = 0,
+        food = 0,
+        sumLum = 0,
+        sumSat = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i],
+          g = data[i + 1],
+          b = data[i + 2];
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        const sat = max === 0 ? 0 : (max - min) / max;
+        sumLum += lum;
+        sumSat += sat;
+        // 皿・背景・影：ほぼ無彩色で非常に明るい/暗いピクセルは食材から除外
+        const isPlate = sat < 0.1 && (lum > 225 || lum < 40);
+        if (isPlate) continue;
+        food++;
+        // 以降の分類は「食材ピクセル」に対してのみ行い、面積比は食材で正規化する
+        // 野菜（緑）
+        if (g > r * 1.05 && g > b * 1.05 && sat > 0.18) green++;
+        // 揚げ物・肉・パンなどの茶〜金系（高カロリー傾向）
+        if (r > 120 && g > 70 && b < g && r >= g && sat > 0.2 && lum > 60 && lum < 225) warm++;
+        // 主食（白〜淡色：ごはん・麺・パン）。皿は上で除外済み
+        if (lum > 150 && lum < 224 && sat < 0.24 && r > 140 && g > 130) pale++;
+        // 赤（トマト・ソース・赤身肉）
+        if (r > 140 && r > g * 1.35 && r > b * 1.35) red++;
+        // 油・ソースの照り（食材上の鏡面反射：明るく彩度低め）
+        if (lum > 210 && sat < 0.3) gloss++;
+      }
+      const foodN = Math.max(1, food);
+      resolve({
+        brightness: sumLum / n,
+        saturation: sumSat / n,
+        greenRatio: green / foodN,
+        warmRatio: warm / foodN,
+        paleRatio: pale / foodN,
+        redRatio: red / foodN,
+        glossRatio: gloss / foodN,
+        fillRatio: food / n,
+      });
+    };
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+
+const confidenceFromScore = (s) => (s >= 0.66 ? "高" : s >= 0.33 ? "中" : "低");
+
+// 抽出した特徴量から、料理の量・信頼度・隠れ油分を写真ごとに導出する。
+// 写真だけで重量は確定できないため、範囲・信頼度で不確かさを明示する。
+function deriveFoodsFromFeatures(features) {
+  if (!features) {
+    return { foods: initialFoods, notes: [], extraUncertainty: 0.12 };
+  }
+  const { brightness, greenRatio, warmRatio, paleRatio, redRatio, glossRatio, fillRatio } = features;
+  // 盛りの多さ（占有量）でポーションを全体的にスケール
+  const volumeScale = clamp(0.7 + fillRatio * 0.9, 0.7, 1.45);
+
+  const foods = [];
+
+  // 主食（ごはん）：淡色の量に連動（食材面積比で正規化済み）
+  const riceScale = clamp(0.55 + paleRatio * 1.8, 0.55, 1.6) * volumeScale;
+  foods.push({
+    id: "rice",
+    name: "主食（ごはん・麺など）",
+    detail: "白〜淡色の面積から量を推定",
+    amount: Math.round(180 * riceScale),
+    unit: "g",
+    step: 25,
+    baseAmount: 180,
+    baseKcal: 280,
+    protein: 5.0,
+    fat: 1.1,
+    carbs: 62,
+    confidence: confidenceFromScore(clamp(paleRatio * 4, 0, 1)),
+  });
+
+  // 主菜（肉・揚げ物）：茶金＋赤系の量に連動
+  const proteinSignal = clamp(warmRatio * 1.8 + redRatio * 1.1, 0, 1);
+  const proteinScale = clamp(0.5 + proteinSignal * 1.3, 0.5, 1.6) * volumeScale;
+  foods.push({
+    id: "main",
+    name: "主菜（肉・魚・揚げ物）",
+    detail: "こんがりした色・赤身の面積から推定",
+    amount: Math.round(130 * proteinScale),
+    unit: "g",
+    step: 20,
+    baseAmount: 130,
+    baseKcal: 285,
+    protein: 24,
+    fat: 16,
+    carbs: 9,
+    confidence: confidenceFromScore(proteinSignal),
+  });
+
+  // 副菜（サラダ・野菜）：緑の量に連動
+  const veggieSignal = clamp(greenRatio * 2.2, 0, 1);
+  const veggieScale = clamp(0.4 + veggieSignal * 1.5, 0.4, 1.7) * volumeScale;
+  foods.push({
+    id: "salad",
+    name: "副菜（野菜・サラダ）",
+    detail: "緑色の面積から量を推定",
+    amount: Math.round(120 * veggieScale),
+    unit: "g",
+    step: 20,
+    baseAmount: 120,
+    baseKcal: 65,
+    protein: 2.5,
+    fat: 3.2,
+    carbs: 8,
+    confidence: confidenceFromScore(veggieSignal),
+  });
+
+  // 汁物（暗めで彩度低めの構図でより起こりうる）。基本は控えめに含める
+  foods.push({
+    id: "soup",
+    name: "汁物・スープ",
+    detail: "写真から量は仮定",
+    amount: 150,
+    unit: "ml",
+    step: 25,
+    baseAmount: 150,
+    baseKcal: 55,
+    protein: 3.5,
+    fat: 2.0,
+    carbs: 5.5,
+    confidence: "低",
+  });
+
+  // 隠れ油分・ソース：照り（テカリ）と揚げ物色から推定して自動加算
+  const oilSignal = clamp(glossRatio * 3.5 + warmRatio * 0.8, 0, 1.4);
+  if (oilSignal > 0.18) {
+    const oilGram = Math.round(clamp(oilSignal * 9, 2, 14));
+    foods.push({
+      id: "hidden-oil",
+      name: "調理油・ソース（推定）",
+      detail: "テカリ・揚げ色から自動加算",
+      amount: oilGram,
+      unit: "g",
+      step: 2,
+      baseAmount: oilGram,
+      baseKcal: Math.round(oilGram * 8.5),
+      protein: 0,
+      fat: oilGram * 0.95,
+      carbs: 0,
+      confidence: "低",
+    });
+  }
+
+  // 検出した特徴を利用者に見せる（透明性）
+  const notes = [];
+  notes.push(brightness > 150 ? "明るい写真" : brightness > 90 ? "標準的な明るさ" : "やや暗い写真");
+  if (fillRatio > 0.75) notes.push("ボリューム多め");
+  else if (fillRatio < 0.4) notes.push("少量");
+  if (veggieSignal > 0.4) notes.push("野菜多め");
+  if (proteinSignal > 0.4) notes.push("肉・揚げ物多め");
+  if (paleRatio > 0.3) notes.push("主食多め");
+  if (oilSignal > 0.4) notes.push("脂・ソース多め");
+
+  // 写真が暗い/情報が乏しいほど全体の不確かさを増やす
+  let extraUncertainty = 0.14;
+  if (brightness < 80) extraUncertainty += 0.06;
+  if (fillRatio < 0.35) extraUncertainty += 0.05;
+  extraUncertainty = clamp(extraUncertainty, 0.1, 0.28);
+
+  return { foods, notes, extraUncertainty };
 }
 
 function SegmentControl({ value, options, onChange, label }) {
@@ -240,12 +467,15 @@ export function App() {
   const [preview, setPreview] = useState(sampleMealPath);
   const [hint, setHint] = useState("ごはん小盛り、ドレッシングは半分など");
   const [resultVisible, setResultVisible] = useState(false);
-  const [lastUpdated, setLastUpdated] = useState("デモ推定");
+  const [lastUpdated, setLastUpdated] = useState("写真解析");
   const [history, setHistory] = useState([]);
   const [savedNotice, setSavedNotice] = useState("");
   const [customOpen, setCustomOpen] = useState(false);
   const [customName, setCustomName] = useState("ソース");
   const [customKcal, setCustomKcal] = useState(40);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [photoNotes, setPhotoNotes] = useState([]);
+  const [extraUncertainty, setExtraUncertainty] = useState(0.12);
   const fileRef = useRef(null);
   const resultRef = useRef(null);
 
@@ -267,8 +497,9 @@ export function App() {
     );
   }, [foods]);
 
-  const minKcal = totals.kcal * 0.88;
-  const maxKcal = totals.kcal * 1.12;
+  const range = useMemo(() => calculateRange(foods, extraUncertainty), [foods, extraUncertainty]);
+  const minKcal = range.min;
+  const maxKcal = range.max;
   const dailyRatio = (totals.kcal / dailyTarget) * 100;
 
   useEffect(() => {
@@ -312,9 +543,9 @@ export function App() {
         step: item.amount,
         baseAmount: item.amount,
         baseKcal: item.kcal,
-        protein: 0,
-        fat: item.kcal / 9,
-        carbs: 0,
+        protein: item.protein ?? 0,
+        fat: item.fat ?? item.kcal / 9,
+        carbs: item.carbs ?? 0,
         confidence: "低",
       },
     ]);
@@ -353,17 +584,33 @@ export function App() {
     if (!file) return;
     setPreview(URL.createObjectURL(file));
     setResultVisible(false);
-    setLastUpdated("デモ推定");
+    setLastUpdated("写真解析");
     setSavedNotice("");
+    setPhotoNotes([]);
   };
 
-  const runAnalysis = () => {
-    setResultVisible(true);
-    setLastUpdated("デモ推定");
+  const runAnalysis = async () => {
+    setAnalyzing(true);
     setSavedNotice("");
-    window.setTimeout(() => {
-      resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 80);
+    try {
+      const features = await analyzeImageFeatures(preview);
+      const { foods: derived, notes, extraUncertainty: eu } = deriveFoodsFromFeatures(features);
+      setFoods(derived);
+      setPhotoNotes(notes);
+      setExtraUncertainty(eu);
+      setLastUpdated(features ? "写真解析" : "デモ推定");
+    } catch {
+      setFoods(initialFoods);
+      setPhotoNotes([]);
+      setExtraUncertainty(0.12);
+      setLastUpdated("デモ推定");
+    } finally {
+      setAnalyzing(false);
+      setResultVisible(true);
+      window.setTimeout(() => {
+        resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 80);
+    }
   };
 
   const saveMealRecord = () => {
@@ -397,8 +644,10 @@ export function App() {
     setPreview(sampleMealPath);
     setHint("ごはん小盛り、ドレッシングは半分など");
     setResultVisible(false);
-    setLastUpdated("デモ推定");
+    setLastUpdated("写真解析");
     setSavedNotice("");
+    setPhotoNotes([]);
+    setExtraUncertainty(0.12);
     if (fileRef.current) fileRef.current.value = "";
   };
 
@@ -464,9 +713,9 @@ export function App() {
       </label>
 
       <section className="actions-section" aria-label="写真を分析">
-        <button className="primary-button" type="button" onClick={runAnalysis}>
+        <button className="primary-button" type="button" onClick={runAnalysis} disabled={analyzing}>
           <Sparkles size={22} />
-          分析する
+          {analyzing ? "解析中…" : "分析する"}
         </button>
         <button className="secondary-button" type="button" onClick={() => fileRef.current?.click()}>
           <ImageIcon size={22} />
@@ -533,12 +782,24 @@ export function App() {
               <span>脂質 {totals.fat.toFixed(1)}g</span>
               <span>炭水化物 {totals.carbs.toFixed(1)}g</span>
             </div>
+            {photoNotes.length > 0 && (
+              <div className="feature-chips" aria-label="写真から検出した特徴">
+                <span className="feature-chips-label">写真から検出</span>
+                {photoNotes.map((note) => (
+                  <span className="feature-chip" key={note}>
+                    {note}
+                  </span>
+                ))}
+              </div>
+            )}
             <p>
               {sex === "male" ? "成人男性" : "成人女性"}・{ageOptions.find((item) => item.value === age)?.label}
               ・活動量{activityOptions.find((item) => item.value === activity)?.label}の1日目安
               {formatNumber(dailyTarget)} kcalに対して約{Math.round(dailyRatio)}%です。
             </p>
-            <p className="demo-note">APIキー未設定のため、現在はスマホで試せるデモ推定です。</p>
+            <p className="demo-note">
+              写真の色・明るさ・テカリ・占有量をブラウザ内で解析し、料理の量と信頼度を推定しています。写真だけでは重量を確定できないため、幅（範囲）と信頼度で不確かさを示しています。
+            </p>
           </div>
 
           <div className="food-header">
